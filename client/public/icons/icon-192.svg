@@ -1,0 +1,15 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 192 192" fill="none">
+  <rect width="192" height="192" rx="40" fill="#000000"/>
+  <!-- Background glow -->
+  <circle cx="96" cy="96" r="72" fill="url(#grad)" opacity="0.12"/>
+  <!-- Solana-style stacked bars -->
+  <rect x="48" y="60" width="84" height="15" rx="7.5" fill="url(#grad)"/>
+  <rect x="60" y="88.5" width="72" height="15" rx="7.5" fill="url(#grad)"/>
+  <rect x="48" y="117" width="84" height="15" rx="7.5" fill="url(#grad)"/>
+  <defs>
+    <linearGradient id="grad" x1="48" y1="60" x2="132" y2="132" gradientUnits="userSpaceOnUse">
+      <stop offset="0%" stop-color="#9945FF"/>
+      <stop offset="100%" stop-color="#14F195"/>
+    </linearGradient>
+  </defs>
+</svg>
