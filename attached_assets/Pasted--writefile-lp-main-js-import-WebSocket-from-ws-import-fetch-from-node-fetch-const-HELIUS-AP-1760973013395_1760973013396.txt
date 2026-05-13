@@ -1,0 +1,185 @@
+%%writefile  lp_main.js
+import WebSocket from "ws";
+import fetch from "node-fetch";
+
+const HELIUS_API_KEY = "c1935abe-eb98-493f-9776-ab2967e350f4";
+const WS_URL = `wss://mainnet.helius-rpc.com/?api-key=${HELIUS_API_KEY}`;
+const HTTP_URL = `https://mainnet.helius-rpc.com/?api-key=${HELIUS_API_KEY}`;
+const SPL_TOKEN_PROGRAM_ID = "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA";
+
+const MAX_TRACKED = 5;
+const MAX_AGE_MS = 120000; // 2 dakika
+
+const activeMints = new Map();
+
+// LP tespit için genişletilmiş anahtar kelimeler
+const LP_KEYWORDS = [
+  "add_liquidity",
+  "initialize_pool",
+  "CreatePool",
+  "initialize2",
+  "addLiquidity",
+  "InitPool",
+  "initializePool",
+  "init_pool",
+  "addLiquidityToPool",
+  "create_pool",
+  "AddLiquidity",
+  "createLiquidity",
+  "mintToPool",
+  "depositLiquidity",
+  "deposit_liquidity",
+  "pool_initialize",
+  "PoolInit",
+  "create_pool_account",
+  "initialize_pool_account",
+  "addLiquiditySOL",
+  "addLiquidityToken",
+  "addLiquiditySingle",
+];
+
+async function fetchMintAddress(signature) {
+  const body = {
+    jsonrpc: "2.0",
+    id: 1,
+    method: "getTransaction",
+    params: [signature, { encoding: "json", maxSupportedTransactionVersion: 0 }],
+  };
+  const res = await fetch(HTTP_URL, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body),
+  });
+  const data = await res.json();
+  const result = data.result;
+  if (!result) return null;
+  const message = result.transaction && result.transaction.message;
+  const accountKeys = message && message.accountKeys;
+  const instructions = message && message.instructions;
+  if (!accountKeys || !instructions) return null;
+  for (const ix of instructions) {
+    const pid = ix.programIdIndex;
+    if (pid !== undefined && accountKeys[pid] === SPL_TOKEN_PROGRAM_ID) {
+      const accounts = ix.accounts;
+      if (accounts && accounts.length > 0) return accountKeys[accounts[0]];
+    }
+  }
+  return null;
+}
+
+async function fetchTokenMetadata(mintAddress) {
+  const body = { jsonrpc: "2.0", id: 1, method: "getAsset", params: { id: mintAddress } };
+  const res = await fetch(HTTP_URL, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body),
+  });
+  const data = await res.json();
+  const result = data.result;
+  if (!result) return null;
+  const name = (result.content && result.content.metadata && result.content.metadata.name) || "Bilinmiyor";
+  const symbol = (result.content && result.content.metadata && result.content.metadata.symbol) || "Bilinmiyor";
+  if (name === "Bilinmiyor" && symbol === "Bilinmiyor") return null;
+  return { name, symbol };
+}
+
+async function main() {
+  console.log("🚀 Helius LP Tespit Sistemi Başlatılıyor...");
+  const ws = new WebSocket(WS_URL);
+
+  ws.on("open", () => {
+    console.log("✅ WebSocket bağlantısı kuruldu.");
+    const sub = {
+      jsonrpc: "2.0",
+      id: 1,
+      method: "logsSubscribe",
+      params: [{ mentions: [SPL_TOKEN_PROGRAM_ID] }, { commitment: "finalized" }],
+    };
+    ws.send(JSON.stringify(sub));
+  });
+
+  ws.on("message", async (data) => {
+    try {
+      const msg = JSON.parse(data.toString());
+      const logs = msg && msg.params && msg.params.result && msg.params.result.value && msg.params.result.value.logs;
+      const signature = msg && msg.params && msg.params.result && msg.params.result.value && msg.params.result.value.signature;
+      if (!logs || !signature) return;
+
+      for (const log of logs) {
+        if (log.includes("Program log: Instruction: InitializeMint")) {
+          const mintAddress = await fetchMintAddress(signature);
+          if (!mintAddress) return;
+          if (activeMints.size >= MAX_TRACKED) return;
+          if (activeMints.has(mintAddress)) return;
+
+          const meta = await fetchTokenMetadata(mintAddress);
+          if (!meta) return;
+
+          console.log(`🪙 Yeni mint eklendi: ${mintAddress}`);
+          console.log(`🔍 LP kontrol başlatıldı: ${mintAddress}`);
+
+          activeMints.set(mintAddress, Date.now());
+          monitorLP(mintAddress, meta);
+        }
+      }
+    } catch (err) {
+      console.error("❌ Veri hatası:", err);
+    }
+  });
+
+  ws.on("error", (err) => console.error("❌ WebSocket hatası:", err));
+  ws.on("close", () => {
+    console.log("🔌 Bağlantı kapandı, yeniden başlatılıyor...");
+    setTimeout(main, 3000);
+  });
+}
+
+function monitorLP(mintAddress, meta) {
+  const wsLP = new WebSocket(WS_URL);
+  wsLP.on("open", () => {
+    const sub = {
+      jsonrpc: "2.0",
+      id: 1,
+      method: "logsSubscribe",
+      params: [{ mentions: [mintAddress] }, { commitment: "finalized" }],
+    };
+    wsLP.send(JSON.stringify(sub));
+  });
+
+  wsLP.on("message", (data) => {
+    const msg = JSON.parse(data.toString());
+    const logs = msg && msg.params && msg.params.result && msg.params.result.value && msg.params.result.value.logs;
+    if (!logs) return;
+
+    const now = Date.now();
+    const start = activeMints.get(mintAddress);
+    if (!start || now - start > MAX_AGE_MS) {
+      console.log(`⏳ İzleme süresi doldu: ${mintAddress}`);
+      wsLP.close();
+      activeMints.delete(mintAddress);
+      return;
+    }
+
+    for (const log of logs) {
+      if (LP_KEYWORDS.some(keyword => log.includes(keyword))) {
+        console.log(`🪙 Yeni LP eklenmiş Token Tespit Edildi!`);
+        console.log(`📛 Adı: ${meta.name}`);
+        console.log(`🔠 Sembol: ${meta.symbol}`);
+        console.log(`💎 Mint: ${mintAddress}`);
+        console.log(`🌐 Raydium: https://raydium.io/swap/?inputCurrency=sol&outputCurrency=${mintAddress}`);
+        console.log(`🪐 Jupiter: https://jup.ag/swap/${mintAddress}-SOL`);
+        console.log(`📊 Dexscreener: https://dexscreener.com/solana/${mintAddress}`);
+        console.log("-----------------------------------");
+        wsLP.close();
+        activeMints.delete(mintAddress);
+        break;
+      }
+    }
+  });
+
+  wsLP.on("close", () => {
+    if (activeMints.has(mintAddress)) activeMints.delete(mintAddress);
+  });
+}
+
+main().catch(console.error);
