@@ -8,6 +8,7 @@ import { PositionPricer } from "./position-pricer";
 import { saveSecrets } from "./secrets-loader";
 import fs from "fs";
 import path from "path";
+import { EventStore } from "./event-store";
 
 const ROOT = process.cwd();
 
@@ -65,14 +66,29 @@ export async function registerRoutes(app: Express): Promise<Server> {
   const wss = new WebSocketServer({ server: httpServer, path: "/ws" });
 
   const clients = new Set<WebSocket>();
-
++
++  // Persistent event store (server-side)
++  const eventStore = new EventStore();
++
   const broadcastToClients = (message: any) => {
-    const data = JSON.stringify(message);
-    clients.forEach((client) => {
-      if (client.readyState === WebSocket.OPEN) {
-        client.send(data);
-      }
-    });
+-    const data = JSON.stringify(message);
+-    clients.forEach((client) => {
+-      if (client.readyState === WebSocket.OPEN) {
+-        client.send(data);
+-      }
+-    });
++    // message expected: { type: string, data: any }
++    try {
++      const stored = eventStore.append(message.type || "unknown", message.data ?? null);
++      const payload = JSON.stringify(stored);
++      clients.forEach((client) => {
++        if (client.readyState === WebSocket.OPEN) {
++          client.send(payload);
++        }
++      });
++    } catch (err) {
++      _origError("❌ broadcastToClients error:", err);
++    }
   };
 
   // Console yakalayıcıya broadcast fonksiyonunu bağla
@@ -115,6 +131,17 @@ export async function registerRoutes(app: Express): Promise<Server> {
     }
   });
 
++  // Yeni endpoint: kaçırılan (persisted) eventleri al
++  app.get("/api/events", (req, res) => {
++    const afterId = Number(req.query.afterId || 0) || 0;
++    try {
++      const events = eventStore.getAfter(afterId);
++      res.json({ events });
++    } catch (err) {
++      res.status(500).json({ error: (err as Error).message });
++    }
++  });
++
   app.post("/api/update-secrets", (req, res) => {
     const { HELIUS_API_KEY, TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID, TRADER_PRIVATE_KEY } = req.body || {};
     try {
