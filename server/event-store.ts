@@ -3,6 +3,7 @@ import path from "path";
 
 const DATA_DIR = path.resolve(process.cwd(), "data");
 const STORE_PATH = path.join(DATA_DIR, "events.json");
+const MAX_EVENTS = 20; // maksimum saklanacak event sayısı
 
 type StoredEvent = {
   id: number;
@@ -48,7 +49,12 @@ export class EventStore {
       timestamp: Date.now(),
     };
     this.store.events.push(entry);
-    // TODO: retention / kırpma gerekiyorsa burada uygulayabilirsin
+
+    // Retention: sadece son MAX_EVENTS kadarını sakla
+    if (this.store.events.length > MAX_EVENTS) {
+      this.store.events = this.store.events.slice(-MAX_EVENTS);
+    }
+
     saveStore(this.store);
     return entry;
   }
