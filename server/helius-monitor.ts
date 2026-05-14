@@ -2,8 +2,11 @@ import WebSocket from "ws";
 import { secrets } from "./secrets-loader";
 
 const HELIUS_API_KEY = secrets.HELIUS_API_KEY;
-const WS_URL   = `wss://mainnet.helius-rpc.com/?api-key=${HELIUS_API_KEY}`;
-const HTTP_URL  = `https://mainnet.helius-rpc.com/?api-key=${HELIUS_API_KEY}`;
+
+// WebSocket: ücretsiz public RPC — swap/remove/claim bildirimleri Helius kredisi yemez
+const WS_URL  = `wss://api.mainnet-beta.solana.com`;
+// HTTP: Helius — sadece CreatePool tespitinde getTransaction + getAsset için kullanılır
+const HTTP_URL = `https://mainnet.helius-rpc.com/?api-key=${HELIUS_API_KEY}`;
 
 const TELEGRAM_BOT_TOKEN = secrets.TELEGRAM_BOT_TOKEN;
 const TELEGRAM_CHAT_ID   = secrets.TELEGRAM_CHAT_ID;
@@ -38,7 +41,7 @@ async function sendTelegramNotification(message: string): Promise<void> {
   }
 }
 
-// ─── Helius Rate Limiter ─────────────────────────────────────────────────────
+// ─── Rate Limiter ─────────────────────────────────────────────────────────────
 class RateLimiter {
   private queue: Array<() => void> = [];
   private tokens: number;
@@ -80,11 +83,15 @@ class RateLimiter {
   }
 }
 
-// ─── Program ID'leri ────────────────────────────────────────────────────────
+// ─── Sabitler ─────────────────────────────────────────────────────────────────
 const PUMPSWAP = "pAMMBay6oceH9fJKBRHGP5D4bD4sWpmSwMn52FMfXEA";
 const WSOL     = "So11111111111111111111111111111111111111112";
 
-// Telegram bildirimi için minimum TVL eşiği (USD)
+// CreatePool log'unun tam hali — swap/remove/claim'de kesinlikle görünmez
+const LP_LOG_PATTERN   = "Program log: Instruction: CreatePool";
+// Ek kontrol: PumpSwap programının invoke satırı (derinlik 1)
+const PUMPSWAP_INVOKE  = `Program ${PUMPSWAP} invoke [1]`;
+
 const MIN_TVL_USD_NOTIFY = 40000;
 
 const TROJAN_BOT = "solana_trojanbot";
@@ -97,9 +104,13 @@ interface TokenMetadata {
   symbol: string;
 }
 
+/**
+ * Sadece LP oluşturma (CreatePool) olaylarını dinler.
+ * Swap / remove / fee-claim gibi diğer PumpSwap işlemleri
+ * herhangi bir HTTP çağrısı tetiklemeden log seviyesinde atlanır.
+ */
 export class HeliusMonitor {
   private dexWebSocket: WebSocket | null = null;
-
   private processedDexSignatures: Set<string> = new Set();
 
   private reconnectTimeoutDex: NodeJS.Timeout | null = null;
@@ -108,7 +119,6 @@ export class HeliusMonitor {
 
   private eventEmitter: (event: string, data: any) => void;
   private isRunning = false;
-
   private solPriceUsd: number = 0;
   private rateLimiter = new RateLimiter(8);
 
@@ -119,7 +129,7 @@ export class HeliusMonitor {
   async start() {
     if (this.isRunning) { console.log("⚠️ Monitor zaten çalışıyor"); return; }
     this.isRunning = true;
-    console.log("🚀 Helius Monitor başlatılıyor (PumpSwap)...");
+    console.log("🚀 Helius Monitor başlatılıyor (PumpSwap — sadece CreatePool)...");
     this.eventEmitter("monitoring_state", { isMonitoring: true });
 
     await this.fetchSolPriceOnce();
@@ -132,8 +142,8 @@ export class HeliusMonitor {
     const SOL_MINT = "So11111111111111111111111111111111111111112";
 
     try {
-      const res   = await fetch(`https://lite-api.jup.ag/price/v3?ids=${SOL_MINT}`);
-      const data  = await res.json();
+      const res  = await fetch(`https://lite-api.jup.ag/price/v3?ids=${SOL_MINT}`);
+      const data = await res.json();
       const price = data?.[SOL_MINT]?.usdPrice;
       if (typeof price === "number" && price > 0) {
         this.solPriceUsd = price;
@@ -145,8 +155,8 @@ export class HeliusMonitor {
     }
 
     try {
-      const res   = await fetch("https://api.coingecko.com/api/v3/simple/price?ids=solana&vs_currencies=usd");
-      const data  = await res.json();
+      const res  = await fetch("https://api.coingecko.com/api/v3/simple/price?ids=solana&vs_currencies=usd");
+      const data = await res.json();
       const price = data?.solana?.usd;
       if (typeof price === "number" && price > 0) {
         this.solPriceUsd = price;
@@ -181,28 +191,30 @@ export class HeliusMonitor {
     sendTelegramNotification(
       `📡 <b>Sistem Aktif — Taranıyor</b>\n\n` +
       `🕐 <b>Saat:</b> ${now}\n` +
-      `✅ Helius bağlantısı canlı\n` +
-      `🔍 PumpSwap LP'leri izleniyor\n\n` +
+      `✅ Bağlantı canlı (Public RPC → WS | Helius → HTTP)\n` +
+      `🔍 Yalnızca PumpSwap LP oluşturmaları izleniyor\n\n` +
       `<i>LP tespit edildiği anda bildirim alacaksınız.</i>`
     );
   }
 
   // ═══════════════════════════════════════════════════════════════════════════
-  // WS — PumpSwap LP oluşturma olayları
+  // WebSocket — PumpSwap logsSubscribe
+  // Public RPC üzerinden dinlenir → Helius kredisi yok.
+  // Sadece CreatePool logları içeren TX'ler işlenir;
+  // swap / remove / claim / diğerleri sıfır HTTP çağrısıyla atlanır.
   // ═══════════════════════════════════════════════════════════════════════════
   private connectDex() {
-    if (!HELIUS_API_KEY) return;
-
     this.dexWebSocket = new WebSocket(WS_URL);
 
     this.dexWebSocket.on("open", () => {
-      console.log("✅ [WS] DEX WebSocket bağlandı (PumpSwap)");
+      console.log("✅ [WS] DEX WebSocket bağlandı (Public RPC — PumpSwap LP only)");
       this.dexWebSocket?.send(JSON.stringify({
         jsonrpc: "2.0",
         id: 100,
         method: "logsSubscribe",
         params: [{ mentions: [PUMPSWAP] }, { commitment: "confirmed" }],
       }));
+
       if (this.pingIntervalDex) clearInterval(this.pingIntervalDex);
       this.pingIntervalDex = setInterval(() => {
         if (this.dexWebSocket?.readyState === WebSocket.OPEN) {
@@ -211,17 +223,27 @@ export class HeliusMonitor {
       }, 10000);
     });
 
-    this.dexWebSocket.on("message", async (data: Buffer) => {
+    this.dexWebSocket.on("message", async (raw: Buffer) => {
       try {
-        const msg = JSON.parse(data.toString());
-        const logs: string[] | undefined = msg?.params?.result?.value?.logs;
-        const signature: string | undefined = msg?.params?.result?.value?.signature;
+        const msg = JSON.parse(raw.toString());
+        const value = msg?.params?.result?.value;
+        if (!value) return;
+
+        const logs: string[] | undefined = value.logs;
+        const signature: string | undefined = value.signature;
         if (!logs || !signature) return;
+
+        // ── LP filtresi (çift kontrol) ───────────────────────────────────────
+        // 1. PumpSwap programının doğrudan (depth=1) çağrıldığını doğrula
+        // 2. Tam "CreatePool" talimat logunu ara
+        // Bu iki koşul yalnızca yeni havuz oluşturma TX'lerinde aynı anda bulunur.
+        // Swap, RemoveLiquidity, CollectFees vb. işlemlerde bulunmaz → sıfır HTTP çağrısı.
+        const hasInvoke     = logs.includes(PUMPSWAP_INVOKE);
+        const hasCreatePool = logs.some((l) => l === LP_LOG_PATTERN);
+        if (!hasInvoke || !hasCreatePool) return;
+
+        // Tekrar işleme koruması
         if (this.processedDexSignatures.has(signature)) return;
-
-        const isLPEvent = logs.some((log) => log.includes("Instruction: CreatePool"));
-        if (!isLPEvent) return;
-
         this.processedDexSignatures.add(signature);
         if (this.processedDexSignatures.size > 500) {
           const first = this.processedDexSignatures.values().next().value;
@@ -253,7 +275,7 @@ export class HeliusMonitor {
         await this.extractMintsFromDexTx(signature);
 
       if (!tokenMint) {
-        console.warn(`⚠️ [WS] PumpSwap — token mint bulunamadı, swap olabilir.`);
+        console.warn(`⚠️ [WS] PumpSwap — token mint bulunamadı: ${signature.slice(0, 8)}...`);
         return;
       }
 
@@ -268,7 +290,7 @@ export class HeliusMonitor {
       const sol    = liquidityAmount ? `${liquidityAmount.toFixed(4)} SOL` : "?";
       const usdStr = liquidityUsd ? ` ($${liquidityUsd.toFixed(0)})` : "";
       const tvlStr = tvlUsd ? ` | TVL ~$${tvlUsd.toFixed(0)}` : "";
-      console.log(`💧 [WS] ${name} (${symbol}) | PumpSwap | ${sol}${usdStr}${tvlStr}`);
+      console.log(`💧 [LP] ${name} (${symbol}) | PumpSwap | ${sol}${usdStr}${tvlStr}`);
 
       this.eventEmitter("lp_detected", {
         id: `${tokenMint}-${detectedAt}`,
@@ -286,13 +308,13 @@ export class HeliusMonitor {
       const meetsThreshold = (tvlUsd ?? 0) >= MIN_TVL_USD_NOTIFY;
       if (!meetsThreshold) {
         console.log(
-          `🚫 [WS] Telegram atlandı | ${symbol} | TVL=$${tvlUsd?.toFixed(0) ?? "?"} | eşik=$${MIN_TVL_USD_NOTIFY}`
+          `🚫 [LP] Telegram atlandı | ${symbol} | TVL=$${tvlUsd?.toFixed(0) ?? "?"} | eşik=$${MIN_TVL_USD_NOTIFY}`
         );
         return;
       }
 
       const usdLine = liquidityUsd ? `\n💵 <b>USD:</b> $${liquidityUsd.toFixed(2)}` : "";
-      const tvlLine = tvlUsd ? `\n📊 <b>TVL (~×2):</b> $${tvlUsd.toFixed(2)}` : "";
+      const tvlLine = tvlUsd       ? `\n📊 <b>TVL (~×2):</b> $${tvlUsd.toFixed(2)}` : "";
       sendTelegramNotification(
         `💰 <b>YENİ LP TESPİT EDİLDİ! TVL: $${(tvlUsd ?? 0).toFixed(0)}</b>\n\n` +
         `🏊 <b>Platform:</b> PumpSwap\n` +
@@ -323,7 +345,10 @@ export class HeliusMonitor {
           body: JSON.stringify({
             jsonrpc: "2.0", id: 1,
             method: "getTransaction",
-            params: [signature, { encoding: "jsonParsed", maxSupportedTransactionVersion: 0, commitment: "confirmed" }],
+            params: [
+              signature,
+              { encoding: "jsonParsed", maxSupportedTransactionVersion: 0, commitment: "confirmed" },
+            ],
           }),
         });
         const data = await res.json();
@@ -331,8 +356,9 @@ export class HeliusMonitor {
         if (meta) break;
         if (attempt < 3) await new Promise((r) => setTimeout(r, 1500));
       }
+
       if (!meta) {
-        console.warn(`⚠️ [WS] TX indexlenemedi, atlanıyor: ${signature.slice(0, 8)}...`);
+        console.warn(`⚠️ [LP] TX indexlenemedi, atlanıyor: ${signature.slice(0, 8)}...`);
         return { tokenMint: null, lpMint: null };
       }
 
@@ -410,13 +436,18 @@ export class HeliusMonitor {
   // ═══════════════════════════════════════════════════════════════════════════
   stop() {
     if (!this.isRunning) { console.log("⚠️ Monitor zaten durdurulmuş"); return; }
-
     console.log("🛑 Helius Monitor durduruluyor...");
     this.isRunning = false;
 
-    if (this.reconnectTimeoutDex) { clearTimeout(this.reconnectTimeoutDex); this.reconnectTimeoutDex = null; }
-    if (this.heartbeatInterval)   { clearInterval(this.heartbeatInterval);  this.heartbeatInterval   = null; }
-    if (this.pingIntervalDex)     { clearInterval(this.pingIntervalDex);     this.pingIntervalDex     = null; }
+    if (this.reconnectTimeoutDex) { clearTimeout(this.reconnectTimeoutDex);  this.reconnectTimeoutDex = null; }
+    if (this.heartbeatInterval)   { clearInterval(this.heartbeatInterval);   this.heartbeatInterval   = null; }
+    if (this.pingIntervalDex)     { clearInterval(this.pingIntervalDex);      this.pingIntervalDex     = null; }
+
+    if (this.dexWebSocket) {
+      this.dexWebSocket.removeAllListeners();
+      this.dexWebSocket.terminate();
+      this.dexWebSocket = null;
+    }
 
     this.processedDexSignatures.clear();
     this.rateLimiter.destroy();
