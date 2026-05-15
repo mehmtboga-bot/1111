@@ -24,6 +24,9 @@ const DEFAULT_CONFIG: TradeConfig = {
   priorityFeeMicroLamports: 200_000,
 };
 
+// StoredEvent type (server tarafından gelen event)
+type StoredEvent = { id: number; type: string; data: any; timestamp: number };
+
 // ---- Geometrik şekil ikonları ----
 function TriangleIcon({ active }: { active: boolean }) {
   return (
@@ -156,7 +159,100 @@ export default function Home() {
     let wsInstance: WebSocket | null = null;
     let reconnectTimeout: NodeJS.Timeout;
 
-    const connect = () => {
+    // Ortak mesaj işleme fonksiyonu
+    const handleIncomingMessage = (msg: StoredEvent) => {
+      if (!msg || typeof msg.type !== "string") return;
+
+      if (msg.type === "mint_detected") {
+        const token = msg.data;
+        setMintedTokens((prev) => {
+          const next = [token, ...prev.filter((t) => t.id !== token.id)].slice(0, MAX_MINTED_TOKENS);
+          try { localStorage.setItem("mintedTokens", JSON.stringify(next)); } catch {}
+          return next;
+        });
+        setNewTokenId(token.id);
+        setTimeout(() => setNewTokenId(null), 1000);
+      } else if (msg.type === "lp_detected") {
+        const lpLog = msg.data;
+        setLpLogs((prev) => {
+          const next = [lpLog, ...prev.filter((l) => l.id !== lpLog.id)].slice(0, MAX_LP_LOGS);
+          try { localStorage.setItem("lpLogs", JSON.stringify(next)); } catch {}
+          return next;
+        });
+      } else if (msg.type === "connection_status") {
+        setIsConnected(msg.data.connected);
+        setConnectionMessage(msg.data.message || "");
+        if (msg.data.isMonitoring !== undefined) setIsMonitoring(msg.data.isMonitoring);
+      } else if (msg.type === "monitoring_state") {
+        setIsMonitoring(msg.data.isMonitoring);
+      } else if (msg.type === "balance_update") {
+        setWalletBalance(msg.data.balance);
+        setLastPublicKey(msg.data.publicKey);
+      } else if (msg.type === "error") {
+        setConnectionMessage(msg.data.message);
+      } else if (msg.type === "server_log") {
+        setServerLogs((prev) => {
+          const next = [
+            ...prev,
+            {
+              id: ++logIdRef.current,
+              level: msg.data.level,
+              message: msg.data.message,
+              timestamp: msg.data.timestamp,
+            },
+          ].slice(-300);
+          try { localStorage.setItem("serverLogs", JSON.stringify(next)); } catch {}
+          return next;
+        });
+      } else if (msg.type === "positions_snapshot") {
+        setPositions(msg.data.positions);
+        setTradeConfig(msg.data.config);
+        setTraderPublicKey(msg.data.traderPublicKey);
+        setTraderReady(msg.data.traderReady);
+        if (typeof msg.data.solPriceUsd === "number" && msg.data.solPriceUsd > 0) {
+          setSolPriceUsd(msg.data.solPriceUsd);
+        }
+        try { localStorage.setItem("positions", JSON.stringify(msg.data.positions)); } catch {}
+      } else if (msg.type === "position_update") {
+        const updated = msg.data;
+        setPositions((prev) => {
+          const idx = prev.findIndex((p) => p.id === updated.id);
+          const next = idx >= 0 ? [...prev] : [updated, ...prev];
+          if (idx >= 0) next[idx] = updated;
+          try { localStorage.setItem("positions", JSON.stringify(next)); } catch {}
+          return next;
+        });
+      } else if (msg.type === "trade_config_update") {
+        setTradeConfig(msg.data);
+        try { localStorage.setItem("tradeConfig", JSON.stringify(msg.data)); } catch {}
+      }
+
+      // Gelen event id'sini sakla
+      try {
+        const last = Number(localStorage.getItem("lastEventId") || "0");
+        if (typeof msg.id === "number" && msg.id > last) {
+          localStorage.setItem("lastEventId", String(msg.id));
+        }
+      } catch {}
+    };
+
+    const connect = async () => {
+      // 1) Missed events al
+      const lastSeen = Number(localStorage.getItem("lastEventId") || "0") || 0;
+      try {
+        const resp = await fetch(`/api/events?afterId=${lastSeen}`);
+        if (resp.ok) {
+          const body = await resp.json();
+          const missed: StoredEvent[] = body.events || [];
+          for (const ev of missed) {
+            handleIncomingMessage(ev);
+          }
+        }
+      } catch (err) {
+        console.warn("events fetch hatası:", err);
+      }
+
+      // 2) WS bağlan
       wsInstance = new WebSocket(wsUrl);
       setWs(wsInstance);
 
@@ -167,58 +263,8 @@ export default function Home() {
 
       wsInstance.onmessage = (event) => {
         try {
-          const message: WSMessage = JSON.parse(event.data);
-          if (message.type === "mint_detected") {
-            const token = message.data;
-            setMintedTokens((prev) => [token, ...prev.filter((t) => t.id !== token.id)].slice(0, MAX_MINTED_TOKENS));
-            setNewTokenId(token.id);
-            setTimeout(() => setNewTokenId(null), 1000);
-          } else if (message.type === "lp_detected") {
-            const lpLog = message.data;
-            setLpLogs((prev) => [lpLog, ...prev.filter((l) => l.id !== lpLog.id)].slice(0, MAX_LP_LOGS));
-          } else if (message.type === "connection_status") {
-            setIsConnected(message.data.connected);
-            setConnectionMessage(message.data.message || "");
-            if (message.data.isMonitoring !== undefined) setIsMonitoring(message.data.isMonitoring);
-          } else if (message.type === "monitoring_state") {
-            setIsMonitoring(message.data.isMonitoring);
-          } else if (message.type === "balance_update") {
-            setWalletBalance(message.data.balance);
-            setLastPublicKey(message.data.publicKey);
-          } else if (message.type === "error") {
-            setConnectionMessage(message.data.message);
-          } else if (message.type === "server_log") {
-            setServerLogs((prev) => [
-              ...prev,
-              {
-                id: ++logIdRef.current,
-                level: message.data.level,
-                message: message.data.message,
-                timestamp: message.data.timestamp,
-              },
-            ].slice(-300));
-          } else if (message.type === "positions_snapshot") {
-            setPositions(message.data.positions);
-            setTradeConfig(message.data.config);
-            setTraderPublicKey(message.data.traderPublicKey);
-            setTraderReady(message.data.traderReady);
-            if (typeof message.data.solPriceUsd === "number" && message.data.solPriceUsd > 0) {
-              setSolPriceUsd(message.data.solPriceUsd);
-            }
-          } else if (message.type === "position_update") {
-            const updated = message.data;
-            setPositions((prev) => {
-              const idx = prev.findIndex((p) => p.id === updated.id);
-              if (idx >= 0) {
-                const next = [...prev];
-                next[idx] = updated;
-                return next;
-              }
-              return [updated, ...prev];
-            });
-          } else if (message.type === "trade_config_update") {
-            setTradeConfig(message.data);
-          }
+          const message: StoredEvent = JSON.parse(event.data);
+          handleIncomingMessage(message);
         } catch { /* ignore */ }
       };
 
