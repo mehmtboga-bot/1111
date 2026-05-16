@@ -14,7 +14,6 @@ const MAX_MINTED_TOKENS = 7;
 const MAX_LP_LOGS = 30;
 const MINT_DISPLAY_DURATION = 3 * 60 * 1000;
 const LP_LOG_DURATION = 5 * 60 * 1000;
-const SOL_PRICE = 87;
 
 type Tab = "console" | "dashboard" | "trade" | "files";
 
@@ -301,7 +300,9 @@ export default function Home() {
 
   const lockedLogs = lpLogs.filter((l) => l.isLocked);
   const totalSol = lpLogs.reduce((s, l) => s + (l.liquidityAmount ?? 0), 0);
-  const totalUsd = totalSol * SOL_PRICE;
+  // Dinamik fiyat: solPriceUsd server'dan geliyor, fallback: 87
+  const displayPrice = solPriceUsd > 0 ? solPriceUsd : 87;
+  const totalUsd = totalSol * displayPrice;
   const openPositionCount = positions.filter((p) => p.status === "open" || p.status === "pending_buy" || p.status === "pending_sell").length;
 
   const activeBuyMints = new Set(
@@ -452,12 +453,12 @@ export default function Home() {
                       <Lock className="h-3 w-3 mr-1" />{lockedLogs.length} kilitli
                     </Badge>
                   )}
-                  <span className="text-xs text-muted-foreground ml-auto">1 SOL = ${SOL_PRICE} · TVL = 2×SOL×$92</span>
+                  <span className="text-xs text-muted-foreground ml-auto">1 SOL = ${displayPrice.toFixed(2)} · TVL = 2×SOL×${displayPrice.toFixed(2)}</span>
                 </div>
                 <LPLogTable
                   logs={lpLogs}
                   filter="all"
-                  solPrice={SOL_PRICE}
+                  solPrice={displayPrice}
                   emptyMessage="LP tespiti bekleniyor..."
                   traderReady={traderReady}
                   activeBuyMints={activeBuyMints}
