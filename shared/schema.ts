@@ -61,8 +61,8 @@ export type Position = z.infer<typeof positionSchema>;
 
 export const tradeConfigSchema = z.object({
   solAmount: z.number().min(0.0001),
-  slippageBps: z.number().min(50).max(10000),
-  priorityFeeMicroLamports: z.number().min(0).max(10_000_000),
+  slippageBps: z.number().min(50).max(1000000),
+  priorityFeeMicroLamports: z.number().min(0).max(100_000_000),
 });
 
 export type TradeConfig = z.infer<typeof tradeConfigSchema>;
