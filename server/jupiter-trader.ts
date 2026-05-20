@@ -33,12 +33,20 @@ interface QuoteResponse {
   contextSlot?: number;
 }
 
+interface CachedBalance {
+  uiAmount: number;
+  raw: string;
+  decimals: number;
+  timestamp: number;
+}
+
 export class JupiterTrader {
   private store: TradeStore;
   private emit: Emitter;
   private keypair: Keypair | null = null;
   private connection: Connection | null = null;
   private decimalsCache: Map<string, number> = new Map();
+  private balanceCache: Map<string, CachedBalance> = new Map();
   private inFlight: Set<string> = new Set();
 
   constructor(store: TradeStore, emit: Emitter) {
@@ -104,6 +112,13 @@ export class JupiterTrader {
 
   private async getTokenBalance(mint: string): Promise<{ uiAmount: number; raw: string; decimals: number } | null> {
     if (!this.keypair || !this.connection) return null;
+    
+    // Balance cache kontrol (2 saniye geçerliliği)
+    const cached = this.balanceCache.get(mint);
+    if (cached && Date.now() - cached.timestamp < 2000) {
+      return { uiAmount: cached.uiAmount, raw: cached.raw, decimals: cached.decimals };
+    }
+
     try {
       const res = await this.connection.getParsedTokenAccountsByOwner(this.keypair.publicKey, {
         mint: new PublicKey(mint),
@@ -117,6 +132,10 @@ export class JupiterTrader {
         totalRaw += BigInt(info.amount);
       }
       const uiAmount = Number(totalRaw) / Math.pow(10, decimals);
+      
+      // Cache'e kaydet
+      this.balanceCache.set(mint, { uiAmount, raw: totalRaw.toString(), decimals, timestamp: Date.now() });
+      
       return { uiAmount, raw: totalRaw.toString(), decimals };
     } catch (err) {
       console.error("❌ Token bakiye okunamadı:", (err as Error).message);
@@ -130,8 +149,9 @@ export class JupiterTrader {
     amount: string;
     slippageBps: number;
   }, opts: { retries?: number; retryDelayMs?: number } = {}): Promise<QuoteResponse> {
-    const retries = opts.retries ?? 6;
-    const retryDelayMs = opts.retryDelayMs ?? 1500;
+    // Agresif ayarlar: 2 retry, 300ms aralık
+    const retries = opts.retries ?? 2;
+    const retryDelayMs = opts.retryDelayMs ?? 300;
     const url = new URL(JUP_QUOTE);
     url.searchParams.set("inputMint", params.inputMint);
     url.searchParams.set("outputMint", params.outputMint);
@@ -262,12 +282,13 @@ export class JupiterTrader {
         outputMint: mintAddress,
         amount: String(lamports),
         slippageBps: config.slippageBps,
-      });
+      }, { retries: 2, retryDelayMs: 300 });
       const decimals = await this.fetchDecimals(mintAddress);
       const tokensOut = Number(quote.outAmount) / Math.pow(10, decimals);
       const pricePerToken = tokensOut > 0 ? config.solAmount / tokensOut : 0;
 
-      const sig = await this.swap(quote, config.priorityFeeMicroLamports);
+      // 2x priority fee — daha hızlı execution
+      const sig = await this.swap(quote, config.priorityFeeMicroLamports * 2);
 
       position = {
         ...position,
@@ -313,21 +334,33 @@ export class JupiterTrader {
     console.log(`💸 SATIŞ başlıyor: ${pos.symbol} (${pos.mintAddress})`);
 
     try {
-      const balance = await this.getTokenBalance(pos.mintAddress);
+      // Token balance — retry ile (eğer henüz account'a oturmamışsa)
+      let balance = null;
+      for (let attempt = 0; attempt < 3; attempt++) {
+        balance = await this.getTokenBalance(pos.mintAddress);
+        if (balance && BigInt(balance.raw) > 0n) break;
+        if (attempt < 2) {
+          console.warn(`⏳ Token balance deneme ${attempt + 1}/3 — 300ms bekleniyor...`);
+          await new Promise((r) => setTimeout(r, 300));
+        }
+      }
+
       if (!balance || BigInt(balance.raw) === 0n) {
         throw new Error("Cüzdanda token bakiyesi bulunamadı");
       }
 
+      // Agresif quote settings
       const quote = await this.getQuote({
         inputMint: pos.mintAddress,
         outputMint: SOL_MINT,
         amount: balance.raw,
         slippageBps: config.slippageBps,
-      });
+      }, { retries: 2, retryDelayMs: 300 });
       const solOut = Number(quote.outAmount) / 1e9;
       const sellPricePerToken = balance.uiAmount > 0 ? solOut / balance.uiAmount : 0;
 
-      const sig = await this.swap(quote, config.priorityFeeMicroLamports);
+      // 2x priority fee — daha hızlı execution
+      const sig = await this.swap(quote, config.priorityFeeMicroLamports * 2);
 
       const pnlSol = solOut - pos.buySolAmount;
       const pnlPct = pos.buySolAmount > 0 ? (pnlSol / pos.buySolAmount) * 100 : 0;
