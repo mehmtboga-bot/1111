@@ -171,9 +171,9 @@ export class JupiterTrader {
   private async getTokenBalance(mint: string): Promise<{ uiAmount: number; raw: string; decimals: number } | null> {
     if (!this.keypair || !this.connection) return null;
     
-    // Balance cache kontrol (2 saniye geçerliliği)
+    // Balance cache kontrol (10 saniye geçerliliği — satış hızı için optimize)
     const cached = this.balanceCache.get(mint);
-    if (cached && Date.now() - cached.timestamp < 2000) {
+    if (cached && Date.now() - cached.timestamp < 10000) {
       return { uiAmount: cached.uiAmount, raw: cached.raw, decimals: cached.decimals };
     }
 
@@ -392,17 +392,9 @@ export class JupiterTrader {
     console.log(`💸 SATIŞ başlıyor: ${pos.symbol} (${pos.mintAddress})`);
 
     try {
-      // Token balance — retry ile (eğer henüz account'a oturmamışsa)
-      let balance = null;
-      for (let attempt = 0; attempt < 3; attempt++) {
-        balance = await this.getTokenBalance(pos.mintAddress);
-        if (balance && BigInt(balance.raw) > 0n) break;
-        if (attempt < 2) {
-          console.warn(`⏳ Token balance deneme ${attempt + 1}/3 — 300ms bekleniyor...`);
-          await new Promise((r) => setTimeout(r, 300));
-        }
-      }
-
+      // Token balance — cache'ten instant al (retry yok, hızlı satış için)
+      const balance = await this.getTokenBalance(pos.mintAddress);
+      
       if (!balance || BigInt(balance.raw) === 0n) {
         throw new Error("Cüzdanda token bakiyesi bulunamadı");
       }
