@@ -14,6 +14,7 @@ const DEFAULT_CONFIG: TradeConfig = {
 interface StoreData {
   positions: Position[];
   config: TradeConfig;
+  solPriceUsd?: number;
 }
 
 function ensureDir() {
@@ -26,17 +27,18 @@ function load(): StoreData {
   try {
     ensureDir();
     if (!fs.existsSync(STORE_PATH)) {
-      return { positions: [], config: { ...DEFAULT_CONFIG } };
+      return { positions: [], config: { ...DEFAULT_CONFIG }, solPriceUsd: 87 };
     }
     const raw = fs.readFileSync(STORE_PATH, "utf-8");
     const parsed = JSON.parse(raw);
     return {
       positions: Array.isArray(parsed.positions) ? parsed.positions : [],
       config: { ...DEFAULT_CONFIG, ...(parsed.config || {}) },
+      solPriceUsd: parsed.solPriceUsd ?? 87,
     };
   } catch (err) {
     console.error("⚠️ trades.json okunamadı, sıfırlanıyor:", (err as Error).message);
-    return { positions: [], config: { ...DEFAULT_CONFIG } };
+    return { positions: [], config: { ...DEFAULT_CONFIG }, solPriceUsd: 87 };
   }
 }
 
@@ -107,5 +109,14 @@ export class TradeStore {
     this.data.config = { ...this.data.config, ...partial };
     save(this.data);
     return { ...this.data.config };
+  }
+
+  setSolPriceUsd(price: number): void {
+    this.data.solPriceUsd = price;
+    save(this.data);
+  }
+
+  getSolPriceUsd(): number {
+    return this.data.solPriceUsd ?? 87;
   }
 }
