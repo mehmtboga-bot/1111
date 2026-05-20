@@ -247,6 +247,29 @@ export class JupiterTrader {
   private async swap(quote: QuoteResponse, priorityFeeMicroLamports: number): Promise<string> {
     if (!this.keypair || !this.connection) throw new Error("Cüzdan/RPC hazır değil");
 
+    // ═══════════════════════════════════════════════════════════════
+    // 1️⃣ DİNAMİK PRIORITY FEE (ağ yoğunluğuna göre)
+    // ═══════════════════════════════════════════════════════════════
+    const solPrice = this.store.getSolPriceUsd() || 87;
+    let dynamicFee = priorityFeeMicroLamports;
+    
+    if (solPrice > 200) {
+      dynamicFee = priorityFeeMicroLamports * 5;
+      console.log(`⚡ SOL=$${solPrice} | 5x priority fee`);
+    } else if (solPrice > 150) {
+      dynamicFee = priorityFeeMicroLamports * 4;
+      console.log(`⚡ SOL=$${solPrice} | 4x priority fee`);
+    } else if (solPrice > 100) {
+      dynamicFee = priorityFeeMicroLamports * 3;
+      console.log(`⚡ SOL=$${solPrice} | 3x priority fee`);
+    } else {
+      dynamicFee = priorityFeeMicroLamports * 2;
+      console.log(`🟡 SOL=$${solPrice} | 2x priority fee`);
+    }
+
+    // ═══════════════════════════════════════════════════════════════
+    // 2️⃣ SWAP BODY HAZIRLA
+    // ═══════════════════════════════════════════════════════════════
     const swapBody = {
       quoteResponse: quote,
       userPublicKey: this.keypair.publicKey.toBase58(),
@@ -254,47 +277,134 @@ export class JupiterTrader {
       dynamicComputeUnitLimit: true,
       prioritizationFeeLamports: {
         priorityLevelWithMaxLamports: {
-          maxLamports: Math.max(priorityFeeMicroLamports, 1),
+          maxLamports: Math.max(dynamicFee, 1),
           priorityLevel: "veryHigh",
         },
       },
     };
 
-    const swapRes = await fetch(JUP_SWAP, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(swapBody),
-    });
+    // ═══════════════════════════════════════════════════════════════
+    // 3️⃣ JUPITER API'YE SWAP İSTEĞİ GÖNDER (10s timeout)
+    // ═══════════════════════════════════════════════════════════════
+    let swapRes: Response;
+    try {
+      swapRes = await Promise.race([
+        fetch(JUP_SWAP, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(swapBody),
+        }),
+        new Promise<Response>((_, reject) =>
+          setTimeout(() => reject(new Error("Jupiter API timeout 10s")), 10000)
+        ),
+      ]);
+    } catch (err) {
+      throw new Error(`Jupiter API başarısız: ${(err as Error).message}`);
+    }
+
     if (!swapRes.ok) {
       const text = await swapRes.text().catch(() => "");
-      throw new Error(`Jupiter swap ${swapRes.status}: ${text.slice(0, 200)}`);
+      throw new Error(`Jupiter ${swapRes.status}: ${text.slice(0, 200)}`);
     }
-    const swapJson = (await swapRes.json()) as { swapTransaction: string };
-    if (!swapJson.swapTransaction) throw new Error("swapTransaction alınamadı");
 
+    const swapJson = (await swapRes.json()) as { swapTransaction: string };
+    if (!swapJson.swapTransaction) {
+      throw new Error("swapTransaction alınamadı");
+    }
+
+    console.log(`✅ Jupiter swap işlem binary'si alındı`);
+
+    // ═══════════════════════════════════════════════════════════════
+    // 4️⃣ İŞLEMİ DESERIALIZE ET VE İMZALA
+    // ═══════════════════════════════════════════════════════════════
     const txBuf = Buffer.from(swapJson.swapTransaction, "base64");
     const tx = VersionedTransaction.deserialize(txBuf);
     tx.sign([this.keypair]);
-
     const raw = tx.serialize();
-    const signature = await this.connection.sendRawTransaction(raw, {
-      skipPreflight: true,
-      maxRetries: 3,
-    });
 
-    const latest = await this.connection.getLatestBlockhash("confirmed");
-    const conf = await this.connection.confirmTransaction(
-      {
-        signature,
-        blockhash: latest.blockhash,
-        lastValidBlockHeight: latest.lastValidBlockHeight,
-      },
-      "confirmed",
-    );
-    if (conf.value.err) {
-      throw new Error(`İşlem hata ile sonuçlandı: ${JSON.stringify(conf.value.err)}`);
+    console.log(`✅ İşlem imzalandı`);
+
+    // ═══════════════════════════════════════════════════════════════
+    // 5️⃣ BLOCKCHAIN'E GÖNDER (agresif retry + timeout)
+    // ═══════════════════════════════════════════════════════════════
+    let signature: string | null = null;
+    const maxAttempts = 5;
+
+    for (let attempt = 0; attempt < maxAttempts; attempt++) {
+      try {
+        signature = await Promise.race([
+          this.connection!.sendRawTransaction(raw, {
+            skipPreflight: true,
+            maxRetries: 3,
+          }),
+          new Promise<string>((_, reject) =>
+            setTimeout(() => reject(new Error("SendTx timeout 5s")), 5000)
+          ),
+        ]);
+
+        console.log(`✅ Deneme ${attempt + 1}: TX blockchain'e gönderildi: ${signature.slice(0, 16)}...`);
+        break;
+      } catch (err) {
+        const message = (err as Error).message;
+        console.warn(`⚠️ Deneme ${attempt + 1}/${maxAttempts} başarısız: ${message}`);
+
+        if (attempt < maxAttempts - 1) {
+          const waitMs = 100 * Math.pow(2, attempt);
+          console.log(`⏳ ${waitMs}ms bekleniyor, tekrar deneniyor...`);
+          await new Promise((r) => setTimeout(r, waitMs));
+        } else {
+          throw new Error(`TX ${maxAttempts} kez başarısız: ${message}`);
+        }
+      }
     }
+
+    if (!signature) {
+      throw new Error("TX signature alınamadı");
+    }
+
+    // ═══════════════════════════════════════════════════════════════
+    // 6️⃣ FAST CONFIRM POLLING (20s timeout, 300ms interval)
+    // ═══════════════════════════════════════════════════════════════
+    const confirmed = await this.waitForConfirmationFast(signature);
+    
+    if (!confirmed) {
+      console.warn(`⚠️ TX onay timeout (20s), ama blockchain'e gitti: ${signature}`);
+    }
+
     return signature;
+  }
+
+  private async waitForConfirmationFast(signature: string): Promise<boolean> {
+    const startTime = Date.now();
+    const timeoutMs = 20000;
+    const pollIntervalMs = 300;
+
+    let lastStatus = "";
+
+    while (Date.now() - startTime < timeoutMs) {
+      try {
+        const status = await this.connection!.getSignatureStatus(signature);
+
+        if (status.value?.confirmationStatus === "confirmed" || status.value?.confirmationStatus === "finalized") {
+          console.log(`✅ TX CONFIRMED: ${signature.slice(0, 16)}...`);
+          return true;
+        }
+
+        if (status.value?.confirmationStatus === "processed") {
+          if (lastStatus !== "processed") {
+            console.log(`🟡 TX PROCESSED (blok bekleme)...`);
+            lastStatus = "processed";
+          }
+        }
+      } catch (err) {
+        console.error(`⚠️ Status check hatası: ${(err as Error).message}`);
+      }
+
+      await new Promise((r) => setTimeout(r, pollIntervalMs));
+    }
+
+    console.warn(`⚠️ Onay timeout: ${signature.slice(0, 16)}...`);
+    return false;
   }
 
   private updateAndEmit(position: Position) {
@@ -304,24 +414,30 @@ export class JupiterTrader {
 
   async buy(input: { mintAddress: string; name: string; symbol: string }): Promise<Position | null> {
     const { mintAddress, name, symbol } = input;
+
+    // 1️⃣ HAZIRLIK KONTROLLERI
     if (!this.isReady()) {
-      console.error("❌ Cüzdan hazır değil — alım atlandı");
+      console.error("❌ Cüzdan hazır değil");
       return null;
     }
+
     if (this.inFlight.has(`buy:${mintAddress}`)) {
-      console.warn(`⏳ ${symbol} için alım zaten devam ediyor — atlandı`);
+      console.warn(`⏳ ${symbol} için alım zaten devam ediyor`);
       return null;
     }
+
     const existing = this.store.getByMint(mintAddress);
     if (existing && (existing.status === "open" || existing.status === "pending_buy" || existing.status === "pending_sell")) {
-      console.warn(`⚠️ ${symbol} zaten portföyde (${existing.status}) — alım atlandı`);
+      console.warn(`⚠️ ${symbol} zaten portföyde (${existing.status})`);
       return existing;
     }
 
+    // 2️⃣ POSITION'U KAYDET (pending durumda)
     this.inFlight.add(`buy:${mintAddress}`);
     const config = this.store.getConfig();
     const lamports = Math.floor(config.solAmount * 1e9);
     const id = `pos-${mintAddress}-${Date.now()}`;
+
     let position: Position = {
       id,
       mintAddress,
@@ -331,23 +447,36 @@ export class JupiterTrader {
       buyTimestamp: Date.now(),
       buySolAmount: config.solAmount,
     };
+
     this.updateAndEmit(position);
-    console.log(`🛒 ALIM başlıyor: ${symbol} (${mintAddress}) — ${config.solAmount} SOL`);
+    console.log(`🛒 HIZLI ALIM BAŞLADI: ${symbol} | ${config.solAmount} SOL`);
 
     try {
-      const quote = await this.getQuote({
-        inputMint: SOL_MINT,
-        outputMint: mintAddress,
-        amount: String(lamports),
-        slippageBps: config.slippageBps,
-      }, { retries: 2, retryDelayMs: 300 });
-      const decimals = await this.fetchDecimals(mintAddress);
+      // 3️⃣ QUOTE + DECIMALS PARALEL AL (⚡ HIZLI)
+      console.log(`📊 Quote ve decimals alınıyor...`);
+      const [quote, decimals] = await Promise.all([
+        this.getQuote(
+          {
+            inputMint: SOL_MINT,
+            outputMint: mintAddress,
+            amount: String(lamports),
+            slippageBps: config.slippageBps,
+          },
+          { retries: 1, retryDelayMs: 100 }
+        ),
+        this.fetchDecimals(mintAddress),
+      ]);
+
       const tokensOut = Number(quote.outAmount) / Math.pow(10, decimals);
       const pricePerToken = tokensOut > 0 ? config.solAmount / tokensOut : 0;
 
-      // 2x priority fee — daha hızlı execution
-      const sig = await this.swap(quote, config.priorityFeeMicroLamports * 2);
+      console.log(`📈 Quote alındı: ${tokensOut.toFixed(4)} ${symbol} | Price: ${pricePerToken.toFixed(9)} SOL/token`);
 
+      // 4️⃣ SWAP İŞLEMİ BAŞLAT (3x priority fee = çok hızlı)
+      console.log(`🚀 Blockchain'e gönderiliyor (3x priority fee)...`);
+      const sig = await this.swap(quote, config.priorityFeeMicroLamports * 3);
+
+      // 5️⃣ BAŞARILI - POSITION'U GÜNCELLE
       position = {
         ...position,
         status: "open",
@@ -355,17 +484,30 @@ export class JupiterTrader {
         buyPriceSol: pricePerToken,
         buyTxSignature: sig,
       };
+
       this.updateAndEmit(position);
-      console.log(`✅ ALIM tamam: ${symbol} | ${tokensOut.toFixed(4)} ${symbol} | tx ${sig.slice(0, 16)}...`);
+      console.log(`✅ ALIM BAŞARILI: ${tokensOut.toFixed(4)} ${symbol}`);
+      console.log(`   TX: https://solscan.io/tx/${sig}`);
+      console.log(`   Fiyat: ${pricePerToken.toFixed(9)} SOL/token`);
+
       return position;
     } catch (err) {
+      // ❌ HATA - POSITION'U BAŞARISIZ OLARAK KAYDET
       const message = (err as Error).message || String(err);
-      position = { ...position, status: "failed", error: message };
+      position = {
+        ...position,
+        status: "failed",
+        error: message,
+      };
+
       this.updateAndEmit(position);
-      console.error(`❌ ALIM hatası ${symbol}:`, message);
+      console.error(`❌ ALIM HATASI ${symbol}: ${message}`);
+
       return position;
     } finally {
+      // 6️⃣ LOCK'U KALDIR
       this.inFlight.delete(`buy:${mintAddress}`);
+      console.log(`🔓 ${symbol} lock kaldırıldı`);
     }
   }
 
