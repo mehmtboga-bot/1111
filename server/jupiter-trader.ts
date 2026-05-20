@@ -48,11 +48,13 @@ export class JupiterTrader {
   private decimalsCache: Map<string, number> = new Map();
   private balanceCache: Map<string, CachedBalance> = new Map();
   private inFlight: Set<string> = new Set();
+  private priceMonitorInterval: NodeJS.Timer | null = null;
 
   constructor(store: TradeStore, emit: Emitter) {
     this.store = store;
     this.emit = emit;
     this.initWallet();
+    this.startPriceMonitor();
   }
 
   private initWallet() {
@@ -71,6 +73,62 @@ export class JupiterTrader {
       console.log(`💼 Trader cüzdanı yüklendi: ${this.keypair.publicKey.toBase58()}`);
     } catch (err) {
       console.error("❌ TRADER_PRIVATE_KEY çözümlenemedi:", (err as Error).message);
+    }
+  }
+
+  private startPriceMonitor() {
+    // Her 0.5 saniyede open positions'ın fiyatını güncelle
+    this.priceMonitorInterval = setInterval(async () => {
+      await this.updateOpenPositionsPrices();
+    }, 500);
+  }
+
+  private async updateOpenPositionsPrices() {
+    const openPositions = this.store.getOpen();
+    if (openPositions.length === 0) return;
+
+    // Batch price fetch — tüm mint'leri bir istek'te al
+    const mints = openPositions.map((p) => p.mintAddress).join(",");
+    if (!mints) return;
+
+    try {
+      const url = new URL(JUP_PRICE);
+      url.searchParams.set("ids", mints);
+
+      const res = await fetch(url.toString());
+      if (!res.ok) return;
+
+      const data = (await res.json()) as { data: Record<string, { price: number }> };
+      if (!data.data) return;
+
+      const solPriceUsd = this.store.getSolPriceUsd() || 87; // Fallback fiyat
+
+      // Her position'u güncelle
+      for (const pos of openPositions) {
+        const priceData = data.data[pos.mintAddress];
+        if (!priceData || typeof priceData.price !== "number") continue;
+
+        const currentPriceUsd = priceData.price;
+        const buyPriceUsd = pos.buyPriceSol * solPriceUsd;
+
+        // Unrealized P&L hesapla
+        const unrealizedUsd = (currentPriceUsd - buyPriceUsd) * (pos.buyTokenAmount || 0);
+        const unrealizedPnlSol = unrealizedUsd / solPriceUsd;
+        const unrealizedPnlPct = buyPriceUsd > 0 ? ((currentPriceUsd - buyPriceUsd) / buyPriceUsd) * 100 : 0;
+
+        // Position'u güncelle (database'e yazma, sadece in-memory + emit)
+        const updated: Position = {
+          ...pos,
+          currentPriceUsd,
+          unrealizedPnlSol,
+          unrealizedPnlPct,
+        };
+
+        // Broadcast et — client'a gönder
+        this.emit("position_update", updated);
+      }
+    } catch (err) {
+      // Sessiz fail — price update hatası kritik değil
     }
   }
 
@@ -393,5 +451,12 @@ export class JupiterTrader {
     const cfg = this.store.updateConfig(partial);
     this.emit("trade_config_update", cfg);
     return cfg;
+  }
+
+  destroy() {
+    if (this.priceMonitorInterval) {
+      clearInterval(this.priceMonitorInterval);
+      this.priceMonitorInterval = null;
+    }
   }
 }
