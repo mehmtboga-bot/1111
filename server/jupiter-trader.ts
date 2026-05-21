@@ -461,7 +461,7 @@ export class JupiterTrader {
             amount: String(lamports),
             slippageBps: config.slippageBps,
           },
-          { retries: 1, retryDelayMs: 100 }
+          { retries: 2, retryDelayMs: 200 }
         ),
         this.fetchDecimals(mintAddress),
       ]);
@@ -561,7 +561,7 @@ export class JupiterTrader {
           amount: balance.raw,
           slippageBps: config.slippageBps,
         },
-        { retries: 1, retryDelayMs: 100 }  // ⚡ Hızlı
+        { retries: 3, retryDelayMs: 200 }
       );
 
       const solOut = Number(quote.outAmount) / 1e9;
