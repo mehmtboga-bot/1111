@@ -623,3 +623,4 @@ export class JupiterTrader {
       this.priceMonitorInterval = null;
     }
   }
+}
