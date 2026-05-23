@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from "react";
-import { Coins, Droplet, Lock, Wallet, Zap } from "lucide-react";
+import { Coins, Droplet, Lock } from "lucide-react";
 import { ConnectionStatus } from "@/components/ConnectionStatus";
 import { MintedTokenCard } from "@/components/MintedTokenCard";
 import { LPLogTable } from "@/components/LPLogTable";
@@ -21,6 +21,7 @@ const DEFAULT_CONFIG: TradeConfig = {
   solAmount: 0.01,
   slippageBps: 5000,
   priorityFeeMicroLamports: 200_000,
+  takeProfitPct: 0,
 };
 
 // StoredEvent type (server tarafından gelen event)
@@ -95,20 +96,75 @@ function formatTime(ts: number) {
     .join(":");
 }
 
+// ---- localStorage yardımcıları ----
+function loadMintedTokens(): MintedToken[] {
+  try {
+    const raw = localStorage.getItem("mintedTokens");
+    if (!raw) return [];
+    const now = Date.now();
+    const tokens = (JSON.parse(raw) as MintedToken[]).filter((t) => t.expiresAt > now);
+    return tokens.slice(0, MAX_MINTED_TOKENS);
+  } catch {
+    return [];
+  }
+}
+
+function loadLpLogs(): LPDetection[] {
+  try {
+    const raw = localStorage.getItem("lpLogs");
+    if (!raw) return [];
+    const now = Date.now();
+    const logs = (JSON.parse(raw) as LPDetection[]).filter((l) => l.expiresAt > now);
+    return logs.slice(0, MAX_LP_LOGS);
+  } catch {
+    return [];
+  }
+}
+
+function loadPositions(): Position[] {
+  try {
+    const raw = localStorage.getItem("positions");
+    if (!raw) return [];
+    return (JSON.parse(raw) as Position[]);
+  } catch {
+    return [];
+  }
+}
+
+function loadServerLogs(): ServerLog[] {
+  try {
+    const raw = localStorage.getItem("serverLogs");
+    if (!raw) return [];
+    return (JSON.parse(raw) as ServerLog[]);
+  } catch {
+    return [];
+  }
+}
+
+function loadTradeConfig(): TradeConfig {
+  try {
+    const raw = localStorage.getItem("tradeConfig");
+    if (!raw) return DEFAULT_CONFIG;
+    return JSON.parse(raw) as TradeConfig;
+  } catch {
+    return DEFAULT_CONFIG;
+  }
+}
+
 export default function Home() {
   const [activeTab, setActiveTab] = useState<Tab>("dashboard");
   const [isConnected, setIsConnected] = useState(false);
   const [connectionMessage, setConnectionMessage] = useState("");
-  const [mintedTokens, setMintedTokens] = useState<MintedToken[]>([]);
-  const [lpLogs, setLpLogs] = useState<LPDetection[]>([]);
+  const [mintedTokens, setMintedTokens] = useState<MintedToken[]>(loadMintedTokens);
+  const [lpLogs, setLpLogs] = useState<LPDetection[]>(loadLpLogs);
   const [newTokenId, setNewTokenId] = useState<string | null>(null);
   const [isMonitoring, setIsMonitoring] = useState(false);
   const [ws, setWs] = useState<WebSocket | null>(null);
   const [walletBalance, setWalletBalance] = useState<number | null>(null);
   const [lastPublicKey, setLastPublicKey] = useState<string | null>(null);
-  const [serverLogs, setServerLogs] = useState<ServerLog[]>([]);
-  const [positions, setPositions] = useState<Position[]>([]);
-  const [tradeConfig, setTradeConfig] = useState<TradeConfig>(DEFAULT_CONFIG);
+  const [serverLogs, setServerLogs] = useState<ServerLog[]>(loadServerLogs);
+  const [positions, setPositions] = useState<Position[]>(loadPositions);
+  const [tradeConfig, setTradeConfig] = useState<TradeConfig>(loadTradeConfig);
   const [traderPublicKey, setTraderPublicKey] = useState<string | undefined>();
   const [traderReady, setTraderReady] = useState(false);
   const [solPriceUsd, setSolPriceUsd] = useState<number>(0);
@@ -127,9 +183,9 @@ export default function Home() {
     }
   };
 
-  const handleBuy = (mintAddress: string, name: string, symbol: string) => {
+  const handleBuy = (mintAddress: string, name: string, symbol: string, dex: "jupiter" | "pumpswap" = "jupiter") => {
     if (ws && ws.readyState === WebSocket.OPEN) {
-      ws.send(JSON.stringify({ type: "buy_token", data: { mintAddress, name, symbol } }));
+      ws.send(JSON.stringify({ type: "buy_token", data: { mintAddress, name, symbol, dex } }));
     }
   };
 
@@ -212,6 +268,7 @@ export default function Home() {
           setSolPriceUsd(msg.data.solPriceUsd);
         }
         try { localStorage.setItem("positions", JSON.stringify(msg.data.positions)); } catch {}
+        try { localStorage.setItem("tradeConfig", JSON.stringify(msg.data.config)); } catch {}
       } else if (msg.type === "position_update") {
         const updated = msg.data;
         setPositions((prev) => {
@@ -299,10 +356,8 @@ export default function Home() {
   }, [activeTab, serverLogs]);
 
   const lockedLogs = lpLogs.filter((l) => l.isLocked);
-  const totalSol = lpLogs.reduce((s, l) => s + (l.liquidityAmount ?? 0), 0);
   // Dinamik fiyat: solPriceUsd server'dan geliyor, fallback: 87
   const displayPrice = solPriceUsd > 0 ? solPriceUsd : 87;
-  const totalUsd = totalSol * displayPrice;
   const openPositionCount = positions.filter((p) => p.status === "open" || p.status === "pending_buy" || p.status === "pending_sell").length;
 
   const activeBuyMints = new Set(
@@ -427,19 +482,6 @@ export default function Home() {
               setWalletBalance={setWalletBalance}
             />
 
-            {/* İstatistik kartları */}
-            <div className="grid grid-cols-2 sm:grid-cols-4 gap-3">
-              <StatCard label="Aktif Mint"   value={mintedTokens.length} color="text-primary"  icon={<Coins   className="h-4 w-4" />} />
-              <StatCard label="Tüm LP"       value={lpLogs.length}       color="text-chart-4"  icon={<Droplet className="h-4 w-4" />} />
-              <StatCard label="Kilitli LP"   value={lockedLogs.length}   color="text-chart-2"  icon={<Lock    className="h-4 w-4" />} />
-              <StatCard
-                label="Toplam TVL"
-                value={`$${(2 * totalUsd).toLocaleString("en-US", { maximumFractionDigits: 0 })}`}
-                color="text-chart-3"
-                icon={<Wallet className="h-4 w-4" />}
-              />
-            </div>
-
             {/* Ana grid */}
             <div className="grid grid-cols-1 lg:grid-cols-3 gap-6">
               {/* Sol: LP Tespitleri */}
@@ -516,19 +558,6 @@ export default function Home() {
           <FileEditor />
         </div>
       </div>
-    </div>
-  );
-}
-
-function StatCard({
-  label, value, color, icon,
-}: { label: string; value: string | number; color: string; icon: React.ReactNode }) {
-  return (
-    <div className="bg-card border border-card-border rounded-lg p-3 space-y-1">
-      <div className={`flex items-center gap-1.5 text-xs text-muted-foreground ${color}`}>
-        {icon}<span>{label}</span>
-      </div>
-      <p className={`text-xl font-bold ${color}`}>{value}</p>
     </div>
   );
 }
